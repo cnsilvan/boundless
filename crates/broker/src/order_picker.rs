@@ -43,14 +43,13 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use boundless_market::{
-    contracts::{boundless_market::BoundlessMarketService, RequestError, RequestInputType, ProofRequest},
+    contracts::{boundless_market::BoundlessMarketService, RequestError, RequestInputType},
     selector::{SupportedSelectors, is_groth16_selector},
 };
 use moka::future::Cache;
 use thiserror::Error;
 use tokio::{sync::broadcast, sync::mpsc, sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{context::Span, Instrument};
 
 use OrderPricingOutcome::{Lock, ProveAfterLockExpire, Skip};
 
@@ -115,6 +114,12 @@ impl From<anyhow::Error> for OrderPickerErr {
 impl From<RequestError> for OrderPickerErr {
     fn from(err: RequestError) -> Self {
         OrderPickerErr::RequestError(Arc::new(err))
+    }
+}
+
+impl From<crate::config::ConfigErr> for OrderPickerErr {
+    fn from(err: crate::config::ConfigErr) -> Self {
+        OrderPickerErr::UnexpectedErr(Arc::new(err.into()))
     }
 }
 
@@ -1120,7 +1125,7 @@ where
             let available_balance = self.available_gas_balance().await?;
             let gas_price = self.chain_monitor.current_gas_price().await
                 .context("Failed to get gas price")?;
-            let estimated_gas_cost = U256::from(200_000) * gas_price; // 简化的gas估算
+            let estimated_gas_cost = U256::from(200_000) * U256::from(gas_price); // 简化的gas估算
             
             if available_balance < estimated_gas_cost {
                 tracing::debug!("快速模式：余额不足，跳过订单 {}", order_id);
@@ -1176,7 +1181,7 @@ where
 
     /// 运行优化的预检（用于快速模式）
     async fn run_optimized_preflight(&self, order: &OrderRequest) -> Result<u64, OrderPickerErr> {
-        let image_id = Digest::from(order.request.requirements.imageId.0);
+        let _image_id = Digest::from(order.request.requirements.imageId.0);
         
         // 快速检查是否支持该selector
         if !self.supported_selectors.is_supported(order.request.requirements.selector) {
@@ -1271,10 +1276,10 @@ where
         };
         
         // 根据journal predicate复杂度调整
-        let predicate_factor = match request.requirements.predicate.operations.len() {
-            0..=2 => 1.0,
-            3..=5 => 1.3,
-            _ => 1.6,
+        let predicate_factor = match request.requirements.predicate.data.len() {
+            0..=32 => 1.0,     // 简单predicate
+            33..=128 => 1.3,   // 中等复杂度
+            _ => 1.6,          // 复杂predicate
         };
         
         let estimated = (base_cycles as f64 * input_size_factor * selector_factor * predicate_factor) as u64;

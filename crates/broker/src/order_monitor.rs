@@ -225,7 +225,7 @@ where
         let request_id = order.request.id;
 
         // 检查是否启用快速锁定模式
-        let (fast_lock_mode, skip_preflight, skip_price_check, skip_db_check, skip_balance_check, priority_gas_boost) = {
+        let (fast_lock_mode, _skip_preflight, _skip_price_check, skip_db_check, _skip_balance_check, priority_gas_boost) = {
             let config = self.config.lock_all().context("Failed to lock config")?;
             (
                 config.market.fast_lock_mode,
