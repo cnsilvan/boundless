@@ -1205,8 +1205,8 @@ where
         let input_id = upload_input_uri(&self.prover, &order.request, &self.config).await
             .map_err(|e| OrderPickerErr::FetchInputErr(Arc::new(e)))?;
 
-        // 使用较小的executor limit来加快预检
-        let exec_limit = 10_000_000; // 10M cycles limit for fast preflight
+        // 使用较小的executor limit来加快预检 (避免RISC0会话限制)
+        let exec_limit = 80_000_000; // 80M cycles limit for fast preflight (~77Mcycles)
         
         match self.prover.preflight(&image_id_str, &input_id, vec![], Some(exec_limit), &order.id()).await {
             Ok(result) => {
@@ -1284,8 +1284,8 @@ where
         
         let estimated = (base_cycles as f64 * input_size_factor * selector_factor * predicate_factor) as u64;
         
-        // 限制在合理范围内
-        estimated.min(50_000_000).max(100_000) // 100K - 50M cycles
+        // 限制在RISC0会话限制内 (~89Mcycles = 93,323,264 cycles)
+        estimated.min(80_000_000).max(100_000) // 100K - 80M cycles (避免会话限制)
     }
 }
 
