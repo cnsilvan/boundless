@@ -224,41 +224,64 @@ where
     async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
         let request_id = order.request.id;
 
-        let order_status = self
-            .market
-            .get_status(request_id, Some(order.request.expires_at()))
-            .await
-            .context("Failed to get request status")?;
-        if order_status != RequestStatus::Unknown {
-            tracing::info!("Request {:x} not open: {order_status:?}, skipping", request_id);
-            // TODO: fetch some chain data to find out who / and for how much the order
-            // was locked in at
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
-
-        let is_locked = self
-            .db
-            .is_request_locked(U256::from(order.request.id))
-            .await
-            .context("Failed to check if request is locked")?;
-        if is_locked {
-            tracing::warn!("Request 0x{:x} already locked: {order_status:?}, skipping", request_id);
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
-
-        let conf_priority_gas = {
-            let conf = self.config.lock_all().context("Failed to lock config")?;
-            conf.market.lockin_priority_gas
+        // 检查是否启用快速锁定模式
+        let (fast_lock_mode, skip_preflight, skip_price_check, skip_db_check, skip_balance_check, priority_gas_boost) = {
+            let config = self.config.lock_all().context("Failed to lock config")?;
+            (
+                config.market.fast_lock_mode,
+                config.market.fast_lock_skip_preflight,
+                config.market.fast_lock_skip_price_check,
+                config.market.fast_lock_skip_db_check,
+                config.market.fast_lock_skip_balance_check,
+                config.market.priority_gas_boost,
+            )
         };
 
+        // 在快速锁定模式下跳过某些检查
+        if !fast_lock_mode || !skip_db_check {
+            let order_status = self
+                .market
+                .get_status(request_id, Some(order.request.expires_at()))
+                .await
+                .context("Failed to get request status")?;
+            if order_status != RequestStatus::Unknown {
+                tracing::info!("Request {:x} not open: {order_status:?}, skipping", request_id);
+                return Err(OrderMonitorErr::AlreadyLocked);
+            }
+
+            let is_locked = self
+                .db
+                .is_request_locked(U256::from(order.request.id))
+                .await
+                .context("Failed to check if request is locked")?;
+            if is_locked {
+                tracing::warn!("Request 0x{:x} already locked: {order_status:?}, skipping", request_id);
+                return Err(OrderMonitorErr::AlreadyLocked);
+            }
+        } else {
+            tracing::debug!("快速锁定模式：跳过数据库状态检查 for request {:x}", request_id);
+        }
+
+        let mut conf_priority_gas = {
+            let conf = self.config.lock_all().context("Failed to lock config")?;
+            conf.market.lockin_priority_gas.unwrap_or(0)
+        };
+
+        // 在快速锁定模式下增加gas优先级
+        if fast_lock_mode {
+            conf_priority_gas += priority_gas_boost;
+            tracing::debug!("快速锁定模式：为订单 {:x} 增加gas优先级 +{} gwei", request_id, priority_gas_boost);
+        }
+
         tracing::info!(
-            "Locking request: 0x{:x} for stake: {}",
+            "Locking request: 0x{:x} for stake: {} (fast_mode: {})",
             request_id,
-            order.request.offer.lockStake
+            order.request.offer.lockStake,
+            fast_lock_mode
         );
         let lock_block = self
             .market
-            .lock_request(&order.request, order.client_sig.clone(), conf_priority_gas)
+            .lock_request(&order.request, order.client_sig.clone(), Some(conf_priority_gas))
             .await
             .map_err(|e| -> OrderMonitorErr {
                 match e {
@@ -618,10 +641,40 @@ where
         prev_orders_by_status: &mut String,
     ) -> Result<Vec<Arc<OrderRequest>>> {
         let num_orders = orders.len();
+        
+        // 检查快速抢单模式
+        let (grab_mode, fast_lock_max_concurrent) = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            (
+                config.market.order_grab_mode,
+                config.market.fast_lock_max_concurrent_locks,
+            )
+        };
+
+        // 在极速或机关枪模式下，使用更激进的容量管理
+        let capacity = match grab_mode {
+            crate::config::OrderGrabMode::MachineGun | crate::config::OrderGrabMode::ExtremeSpeed => {
+                // 在这些模式下，允许更多并发锁定
+                Capacity::Available(fast_lock_max_concurrent)
+            }
+            crate::config::OrderGrabMode::FastGrab => {
+                // 快速模式使用稍微增加的容量
+                let normal_capacity = self
+                    .get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
+                    .await?;
+                match normal_capacity {
+                    Capacity::Available(slots) => Capacity::Available(slots.max(fast_lock_max_concurrent)),
+                    Capacity::Unlimited => Capacity::Unlimited,
+                }
+            }
+            crate::config::OrderGrabMode::Normal => {
+                // 正常模式使用原始逻辑
+                self.get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
+                    .await?
+            }
+        };
+
         // Get our current capacity for proving orders given our config and the number of orders that are currently committed to be proven + fulfilled.
-        let capacity = self
-            .get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
-            .await?;
         let capacity_granted: usize = capacity
             .request_capacity(num_orders.try_into().expect("Failed to convert order count to u32"))
             as usize;
@@ -831,9 +884,33 @@ where
     ) -> Result<(), OrderMonitorErr> {
         let mut last_block = 0;
         let mut first_block = 0;
+        
+        // 根据抢单模式调整轮询间隔
+        let polling_interval = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            match config.market.order_grab_mode {
+                crate::config::OrderGrabMode::MachineGun => {
+                    // 机关枪模式：极快轮询
+                    Duration::from_millis(50)
+                }
+                crate::config::OrderGrabMode::ExtremeSpeed => {
+                    // 极速模式：很快轮询
+                    Duration::from_millis(100)
+                }
+                crate::config::OrderGrabMode::FastGrab => {
+                    // 快速模式：使用配置的检查间隔
+                    Duration::from_millis(config.market.order_grab_check_interval_ms)
+                }
+                crate::config::OrderGrabMode::Normal => {
+                    // 正常模式：使用区块时间
+                    Duration::from_secs(self.block_time)
+                }
+            }
+        };
+        
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now(),
-            tokio::time::Duration::from_secs(self.block_time),
+            polling_interval,
         );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

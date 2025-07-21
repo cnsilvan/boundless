@@ -43,14 +43,14 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use boundless_market::{
-    contracts::{boundless_market::BoundlessMarketService, RequestError, RequestInputType},
-    selector::SupportedSelectors,
+    contracts::{boundless_market::BoundlessMarketService, RequestError, RequestInputType, ProofRequest},
+    selector::{SupportedSelectors, is_groth16_selector},
 };
 use moka::future::Cache;
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio::task::JoinSet;
+use tokio::{sync::broadcast, sync::mpsc, sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing::{context::Span, Instrument};
 
 use OrderPricingOutcome::{Lock, ProveAfterLockExpire, Skip};
 
@@ -299,6 +299,33 @@ where
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         tracing::debug!("Pricing order {order_id}");
+
+        // 获取当前抢单模式配置
+        let (grab_mode, fast_grab_config, extreme_speed_config, machine_gun_config) = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            (
+                config.market.order_grab_mode,
+                config.market.fast_grab_config.clone(),
+                config.market.extreme_speed_config.clone(),
+                config.market.machine_gun_config.clone(),
+            )
+        };
+
+        // 根据抢单模式选择处理策略
+        match grab_mode {
+            crate::config::OrderGrabMode::MachineGun => {
+                return self.handle_machine_gun_mode(order, &machine_gun_config).await;
+            }
+            crate::config::OrderGrabMode::ExtremeSpeed => {
+                return self.handle_extreme_speed_mode(order, &extreme_speed_config).await;
+            }
+            crate::config::OrderGrabMode::FastGrab => {
+                return self.handle_fast_grab_mode(order, &fast_grab_config).await;
+            }
+            crate::config::OrderGrabMode::Normal => {
+                // 继续正常流程
+            }
+        }
 
         // Lock expiration is the timestamp before which the order must be filled in order to avoid slashing
         let lock_expiration =
@@ -944,6 +971,316 @@ where
     async fn available_stake_balance(&self) -> Result<U256> {
         let balance = self.market.balance_of_stake(self.provider.default_signer_address()).await?;
         Ok(balance)
+    }
+
+    /// 机关枪模式处理：跳过所有预检，直接抢单
+    async fn handle_machine_gun_mode(
+        &self,
+        order: &mut OrderRequest,
+        config: &crate::config::MachineGunConfig,
+    ) -> Result<OrderPricingOutcome, OrderPickerErr> {
+        let order_id = order.id();
+        tracing::info!("处理机关枪模式订单: {}", order_id);
+
+        let now = now_timestamp();
+        let order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
+        
+        // 检查最小订单截止时间
+        if order_expiration.saturating_sub(now) < config.min_order_deadline {
+            tracing::debug!("机关枪模式：订单 {} 时间不足，跳过", order_id);
+            return Ok(OrderPricingOutcome::Skip);
+        }
+
+        // 如果启用了最基本的验证
+        if !config.skip_all_validation {
+            // 只检查订单是否已被锁定
+            if self.db.is_request_locked(U256::from(order.request.id)).await
+                .context("Failed to check if request is locked")? {
+                return Ok(OrderPricingOutcome::Skip);
+            }
+        }
+
+        // 使用假定的cycle数进行快速估算
+        let assumed_cycles = config.assumed_cycles;
+        let lock_expiration = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
+        
+        tracing::info!("机关枪模式：直接接受订单 {} (假定 {} cycles)", order_id, assumed_cycles);
+        
+        Ok(OrderPricingOutcome::Lock {
+            total_cycles: assumed_cycles,
+            target_timestamp_secs: 0, // 立即锁定
+            expiry_secs: lock_expiration,
+        })
+    }
+
+    /// 极速抢单模式处理：直接抢未锁定订单，只检查cycle时间
+    async fn handle_extreme_speed_mode(
+        &self,
+        order: &mut OrderRequest,
+        config: &crate::config::ExtremeSpeedConfig,
+    ) -> Result<OrderPricingOutcome, OrderPickerErr> {
+        let order_id = order.id();
+        tracing::info!("处理极速抢单模式订单: {}", order_id);
+
+        let now = now_timestamp();
+        let lock_expiration = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
+        let order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
+
+        // 基本时间检查
+        if lock_expiration <= now {
+            return Ok(OrderPricingOutcome::Skip);
+        }
+
+        // 检查订单是否已被锁定
+        if self.db.is_request_locked(U256::from(order.request.id)).await
+            .context("Failed to check if request is locked")? {
+            return Ok(OrderPricingOutcome::Skip);
+        }
+
+        // 如果只进行cycle检查
+        if config.cycle_check_only {
+            let time_until_expiration = lock_expiration.saturating_sub(now);
+            let max_cycles = if let Some(peak_khz) = self.config.lock_all()?.market.peak_prove_khz {
+                time_until_expiration * peak_khz * 1000 // khz to cycles per second
+            } else {
+                config.max_mcycles * 1_000_000 // 使用配置的最大mcycles
+            };
+
+            if config.use_fast_cycle_estimation {
+                // 使用快速cycle估算（基于订单复杂度的简单启发式）
+                let estimated_cycles = self.estimate_cycles_heuristic(&order.request);
+                
+                if estimated_cycles > max_cycles {
+                    tracing::debug!("极速模式：订单 {} cycle估算超限 ({} > {})", order_id, estimated_cycles, max_cycles);
+                    return Ok(OrderPricingOutcome::Skip);
+                }
+                
+                return Ok(OrderPricingOutcome::Lock {
+                    total_cycles: estimated_cycles,
+                    target_timestamp_secs: 0,
+                    expiry_secs: lock_expiration,
+                });
+            }
+        }
+
+        // 跳过余额检查
+        if !config.skip_all_balance_checks {
+            // 只进行最基本的gas检查
+            if let Some(min_gas_threshold) = &config.min_gas_threshold {
+                let gas_balance = self.provider.get_balance(self.provider.default_signer_address()).await
+                    .map_err(|err| OrderPickerErr::RpcErr(Arc::new(err.into())))?;
+                let min_threshold = parse_ether(min_gas_threshold)
+                    .context("Failed to parse min_gas_threshold")?;
+                
+                if gas_balance < min_threshold {
+                    tracing::warn!("极速模式：gas余额不足 {} < {}", format_ether(gas_balance), format_ether(min_threshold));
+                    return Ok(OrderPricingOutcome::Skip);
+                }
+            }
+        }
+
+        // 使用配置的最大mcycles作为默认值
+        let estimated_cycles = config.max_mcycles * 1_000_000;
+        
+        Ok(OrderPricingOutcome::Lock {
+            total_cycles: estimated_cycles,
+            target_timestamp_secs: 0,
+            expiry_secs: lock_expiration,
+        })
+    }
+
+    /// 快速抢单模式处理：优化预检流程，跳过非关键检查  
+    async fn handle_fast_grab_mode(
+        &self,
+        order: &mut OrderRequest,
+        config: &crate::config::FastGrabConfig,
+    ) -> Result<OrderPricingOutcome, OrderPickerErr> {
+        let order_id = order.id();
+        tracing::info!("处理快速抢单模式订单: {}", order_id);
+
+        let now = now_timestamp();
+        let lock_expiration = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
+        let order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
+
+        // 基本时间检查
+        if lock_expiration <= now {
+            return Ok(OrderPricingOutcome::Skip);
+        }
+
+        // 数据库状态检查（可跳过）
+        if !config.skip_db_check {
+            if self.db.is_request_locked(U256::from(order.request.id)).await
+                .context("Failed to check if request is locked")? {
+                return Ok(OrderPricingOutcome::Skip);
+            }
+        }
+
+        // 余额检查（可跳过）
+        if !config.skip_balance_check {
+            let available_balance = self.available_gas_balance().await?;
+            let gas_price = self.chain_monitor.current_gas_price().await
+                .context("Failed to get gas price")?;
+            let estimated_gas_cost = U256::from(200_000) * gas_price; // 简化的gas估算
+            
+            if available_balance < estimated_gas_cost {
+                tracing::debug!("快速模式：余额不足，跳过订单 {}", order_id);
+                return Ok(OrderPricingOutcome::Skip);
+            }
+        }
+
+        // 价格检查（可跳过）
+        if !config.skip_price_check {
+            let min_price = self.config.lock_all()?.market.mcycle_price;
+            let min_mcycle_price = parse_ether(&min_price).context("Failed to parse mcycle_price")?;
+            let order_max_price = U256::from(order.request.offer.maxPrice);
+            
+            // 简化的价格检查：确保最大价格至少能覆盖最小mcycle价格
+            if order_max_price < min_mcycle_price {
+                tracing::debug!("快速模式：价格过低，跳过订单 {}", order_id);
+                return Ok(OrderPricingOutcome::Skip);
+            }
+        }
+
+        // 执行优化的预检（带超时）
+        let preflight_result = if config.preflight_timeout_secs > 0 {
+            let timeout_duration = Duration::from_secs(config.preflight_timeout_secs as u64);
+            
+            match tokio::time::timeout(timeout_duration, self.run_optimized_preflight(order)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::warn!("快速模式：订单 {} 预检超时，使用估算值", order_id);
+                    // 使用启发式估算
+                    self.estimate_cycles_heuristic(&order.request)
+                }
+            }
+        } else {
+            // 跳过预检，使用启发式估算
+            self.estimate_cycles_heuristic(&order.request)
+        };
+
+        // Journal大小检查（可跳过）
+        if !config.skip_journal_size_check {
+            let max_journal_bytes = self.config.lock_all()?.market.max_journal_bytes;
+            // 在快速模式下，我们假设journal不会超过限制
+            if preflight_result > 100_000_000 { // 对于非常大的cycle数，可能产生大journal
+                tracing::debug!("快速模式：订单 {} 可能产生大journal，检查跳过", order_id);
+            }
+        }
+
+        Ok(OrderPricingOutcome::Lock {
+            total_cycles: preflight_result,
+            target_timestamp_secs: 0,
+            expiry_secs: lock_expiration,
+        })
+    }
+
+    /// 运行优化的预检（用于快速模式）
+    async fn run_optimized_preflight(&self, order: &OrderRequest) -> Result<u64, OrderPickerErr> {
+        let image_id = Digest::from(order.request.requirements.imageId.0);
+        
+        // 快速检查是否支持该selector
+        if !self.supported_selectors.is_supported(order.request.requirements.selector) {
+            return Err(OrderPickerErr::UnexpectedErr(Arc::new(anyhow::anyhow!(
+                "Unsupported selector"
+            ))));
+        }
+
+        // 尝试使用缓存的结果
+        let cache_key = self.create_preflight_cache_key(order)?;
+        if let Some(cached_value) = self.preflight_cache.get(&cache_key).await {
+            if let PreflightCacheValue::Success { cycle_count, .. } = cached_value {
+                return Ok(cycle_count);
+            }
+        }
+
+        // 执行简化的预检
+        let image_id_str = upload_image_uri(&self.prover, &order.request, &self.config).await
+            .map_err(|e| OrderPickerErr::FetchImageErr(Arc::new(e)))?;
+        
+        let input_id = upload_input_uri(&self.prover, &order.request, &self.config).await
+            .map_err(|e| OrderPickerErr::FetchInputErr(Arc::new(e)))?;
+
+        // 使用较小的executor limit来加快预检
+        let exec_limit = 10_000_000; // 10M cycles limit for fast preflight
+        
+        match self.prover.preflight(&image_id_str, &input_id, vec![], Some(exec_limit), &order.id()).await {
+            Ok(result) => {
+                // 缓存结果
+                let cache_value = PreflightCacheValue::Success {
+                    exec_session_id: result.id,
+                    cycle_count: result.stats.total_cycles,
+                    image_id: image_id_str,
+                    input_id,
+                };
+                self.preflight_cache.insert(cache_key, cache_value).await;
+                Ok(result.stats.total_cycles)
+            }
+            Err(_) => {
+                // 预检失败，使用启发式估算
+                Ok(self.estimate_cycles_heuristic(&order.request))
+            }
+        }
+    }
+
+    /// 创建预检缓存键
+    fn create_preflight_cache_key(&self, order: &OrderRequest) -> Result<PreflightCacheKey, OrderPickerErr> {
+        let image_id = Digest::from(order.request.requirements.imageId.0);
+        let input_cache_key = match order.request.input.inputType {
+            RequestInputType::Url => {
+                let input_url = std::str::from_utf8(&order.request.input.data)
+                    .context("input url is not utf8")
+                    .map_err(|e| OrderPickerErr::FetchInputErr(Arc::new(e)))?
+                    .to_string();
+                InputCacheKey::Url(input_url)
+            }
+            RequestInputType::Inline => {
+                let mut hasher = Sha256::new();
+                Sha2Digest::update(&mut hasher, &order.request.input.data);
+                let input_hash: [u8; 32] = hasher.finalize().into();
+                InputCacheKey::Hash(input_hash)
+            }
+            RequestInputType::__Invalid => {
+                return Err(OrderPickerErr::UnexpectedErr(Arc::new(anyhow::anyhow!(
+                    "Unknown input type"
+                ))));
+            }
+        };
+        
+        Ok(PreflightCacheKey { image_id, input: input_cache_key })
+    }
+
+    /// 使用启发式方法估算cycles（无需实际执行）
+    fn estimate_cycles_heuristic(&self, request: &boundless_market::contracts::ProofRequest) -> u64 {
+        // 基于请求特征的简单启发式估算
+        let base_cycles = 1_000_000; // 1M cycles 基础值
+        
+        // 根据输入大小调整
+        let input_size_factor = if request.input.data.len() > 10_000 {
+            2.0
+        } else if request.input.data.len() > 1_000 {
+            1.5
+        } else {
+            1.0
+        };
+        
+        // 根据selector调整（某些proof类型可能更复杂）
+        let selector_factor = if is_groth16_selector(request.requirements.selector) {
+            1.2 // Groth16相对复杂
+        } else {
+            1.0
+        };
+        
+        // 根据journal predicate复杂度调整
+        let predicate_factor = match request.requirements.predicate.operations.len() {
+            0..=2 => 1.0,
+            3..=5 => 1.3,
+            _ => 1.6,
+        };
+        
+        let estimated = (base_cycles as f64 * input_size_factor * selector_factor * predicate_factor) as u64;
+        
+        // 限制在合理范围内
+        estimated.min(50_000_000).max(100_000) // 100K - 50M cycles
     }
 }
 

@@ -77,6 +77,70 @@ mod defaults {
     pub const fn max_concurrent_preflights() -> u32 {
         4
     }
+
+    pub const fn fast_grab_preflight_timeout() -> u32 {
+        30
+    }
+
+    pub const fn fast_grab_max_concurrent() -> u32 {
+        10
+    }
+
+    pub const fn extreme_speed_cycle_check_only() -> bool {
+        false
+    }
+
+    pub const fn extreme_speed_max_mcycles() -> u64 {
+        1000
+    }
+
+    pub const fn extreme_speed_skip_all_balance_checks() -> bool {
+        false
+    }
+
+    pub const fn extreme_speed_use_fast_cycle_estimation() -> bool {
+        false
+    }
+
+    pub const fn machine_gun_skip_preflight() -> bool {
+        false
+    }
+
+    pub const fn machine_gun_max_concurrent() -> u32 {
+        20
+    }
+
+    pub const fn machine_gun_assumed_cycles() -> u64 {
+        1_000_000
+    }
+
+    pub const fn machine_gun_min_order_deadline() -> u64 {
+        60
+    }
+
+    pub const fn machine_gun_skip_all_validation() -> bool {
+        false
+    }
+
+    pub const fn aggressive_gas_multiplier() -> f64 {
+        1.5
+    }
+    
+    pub const fn fast_lock_timeout_secs() -> u32 {
+        15
+    }
+    
+    pub const fn fast_lock_max_concurrent_locks() -> u32 {
+        8
+    }
+    
+    pub const fn order_grab_check_interval_ms() -> u64 {
+        100
+    }
+    
+    pub const fn priority_gas_boost() -> u64 {
+        200
+    }
 }
 
 /// Order pricing priority mode for determining which orders to price first
@@ -110,6 +174,129 @@ pub enum OrderCommitmentPriority {
 impl Default for OrderCommitmentPriority {
     fn default() -> Self {
         Self::Random
+    }
+}
+
+/// 抢单模式枚举
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderGrabMode {
+    /// 正常模式：完整预检和验证
+    Normal,
+    /// 快速抢单模式：优化预检流程，跳过非关键检查
+    FastGrab,
+    /// 极速抢单模式：直接抢未锁定订单，只检查cycle时间
+    ExtremeSpeed,
+    /// 机关枪模式：跳过所有预检，直接抢单
+    MachineGun,
+}
+
+impl Default for OrderGrabMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+/// 快速抢单模式的详细配置
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FastGrabConfig {
+    /// 跳过价格检查
+    #[serde(default)]
+    pub skip_price_check: bool,
+    /// 跳过数据库状态检查
+    #[serde(default)]
+    pub skip_db_check: bool,
+    /// 跳过余额检查
+    #[serde(default)]
+    pub skip_balance_check: bool,
+    /// 预检超时时间（秒）
+    #[serde(default = "defaults::fast_grab_preflight_timeout")]
+    pub preflight_timeout_secs: u32,
+    /// 最大并发抢单数
+    #[serde(default = "defaults::fast_grab_max_concurrent")]
+    pub max_concurrent_grabs: u32,
+    /// 跳过journal大小检查
+    #[serde(default)]
+    pub skip_journal_size_check: bool,
+}
+
+impl Default for FastGrabConfig {
+    fn default() -> Self {
+        Self {
+            skip_price_check: false,
+            skip_db_check: false,
+            skip_balance_check: false,
+            preflight_timeout_secs: defaults::fast_grab_preflight_timeout(),
+            max_concurrent_grabs: defaults::fast_grab_max_concurrent(),
+            skip_journal_size_check: false,
+        }
+    }
+}
+
+/// 极速抢单模式的详细配置
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ExtremeSpeedConfig {
+    /// 只检查cycle估算是否在时间限制内
+    #[serde(default = "defaults::extreme_speed_cycle_check_only")]
+    pub cycle_check_only: bool,
+    /// 最大允许的mcycle限制
+    #[serde(default = "defaults::extreme_speed_max_mcycles")]
+    pub max_mcycles: u64,
+    /// 跳过所有余额检查
+    #[serde(default = "defaults::extreme_speed_skip_all_balance_checks")]
+    pub skip_all_balance_checks: bool,
+    /// 最小gas余额阈值（ETH）
+    pub min_gas_threshold: Option<String>,
+    /// 快速cycle估算方法
+    #[serde(default = "defaults::extreme_speed_use_fast_cycle_estimation")]
+    pub use_fast_cycle_estimation: bool,
+}
+
+impl Default for ExtremeSpeedConfig {
+    fn default() -> Self {
+        Self {
+            cycle_check_only: defaults::extreme_speed_cycle_check_only(),
+            max_mcycles: defaults::extreme_speed_max_mcycles(),
+            skip_all_balance_checks: defaults::extreme_speed_skip_all_balance_checks(),
+            min_gas_threshold: None,
+            use_fast_cycle_estimation: defaults::extreme_speed_use_fast_cycle_estimation(),
+        }
+    }
+}
+
+/// 机关枪模式的详细配置  
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MachineGunConfig {
+    /// 完全跳过预检
+    #[serde(default = "defaults::machine_gun_skip_preflight")]
+    pub skip_preflight: bool,
+    /// 最大并发抢单数
+    #[serde(default = "defaults::machine_gun_max_concurrent")]
+    pub max_concurrent_grabs: u32,
+    /// 使用假定的cycle数进行快速估算
+    #[serde(default = "defaults::machine_gun_assumed_cycles")]
+    pub assumed_cycles: u64,
+    /// 最小订单过期时间（秒）
+    #[serde(default = "defaults::machine_gun_min_order_deadline")]
+    pub min_order_deadline: u64,
+    /// 跳过所有验证
+    #[serde(default = "defaults::machine_gun_skip_all_validation")]
+    pub skip_all_validation: bool,
+    /// 激进的gas设置
+    #[serde(default = "defaults::aggressive_gas_multiplier")]
+    pub aggressive_gas_multiplier: f64,
+}
+
+impl Default for MachineGunConfig {
+    fn default() -> Self {
+        Self {
+            skip_preflight: defaults::machine_gun_skip_preflight(),
+            max_concurrent_grabs: defaults::machine_gun_max_concurrent(),
+            assumed_cycles: defaults::machine_gun_assumed_cycles(),
+            min_order_deadline: defaults::machine_gun_min_order_deadline(),
+            skip_all_validation: defaults::machine_gun_skip_all_validation(),
+            aggressive_gas_multiplier: defaults::aggressive_gas_multiplier(),
+        }
     }
 }
 
@@ -251,6 +438,94 @@ pub struct MarketConf {
     /// - "shortest_expiry": Process orders by shortest expiry first (lock expiry for lock-and-fulfill orders, request expiry for others)
     #[serde(default, alias = "expired_order_fulfillment_priority")]
     pub order_commitment_priority: OrderCommitmentPriority,
+    
+    /// 抢单模式选择
+    ///
+    /// 决定使用哪种抢单策略。选项：
+    /// - "normal": 正常模式，完整预检和验证（默认）
+    /// - "fast_grab": 快速抢单模式，优化预检流程
+    /// - "extreme_speed": 极速抢单模式，直接抢未锁定订单
+    /// - "machine_gun": 机关枪模式，跳过所有预检
+    #[serde(default)]
+    pub order_grab_mode: OrderGrabMode,
+    
+    /// 快速抢单模式配置
+    ///
+    /// 当order_grab_mode为FastGrab时使用的详细配置
+    #[serde(default)]
+    pub fast_grab_config: FastGrabConfig,
+    
+    /// 极速抢单模式配置  
+    ///
+    /// 当order_grab_mode为ExtremeSpeed时使用的详细配置
+    #[serde(default)]
+    pub extreme_speed_config: ExtremeSpeedConfig,
+    
+    /// 机关枪模式配置
+    ///
+    /// 当order_grab_mode为MachineGun时使用的详细配置
+    #[serde(default)]
+    pub machine_gun_config: MachineGunConfig,
+    
+    /// 激进的gas价格倍数
+    ///
+    /// 在快速抢单模式下使用更高的gas价格以提高交易优先级
+    #[serde(default = "defaults::aggressive_gas_multiplier")]
+    pub aggressive_gas_multiplier: f64,
+    
+    /// 快速锁定模式开关
+    ///
+    /// 启用后会跳过一些非关键检查以加快锁定速度
+    #[serde(default)]
+    pub fast_lock_mode: bool,
+    
+    /// 跳过预检查开关
+    ///
+    /// 在快速锁定模式下跳过预执行检查
+    #[serde(default)]
+    pub fast_lock_skip_preflight: bool,
+    
+    /// 快速锁定超时时间（秒）
+    ///
+    /// 快速模式下等待锁定确认的最大时间
+    #[serde(default = "defaults::fast_lock_timeout_secs")]
+    pub fast_lock_timeout_secs: u32,
+    
+    /// 最大并发锁定数
+    ///
+    /// 在快速模式下同时尝试锁定的最大订单数
+    #[serde(default = "defaults::fast_lock_max_concurrent_locks")]
+    pub fast_lock_max_concurrent_locks: u32,
+    
+    /// 订单抢单检查间隔（毫秒）
+    ///
+    /// 检查新订单的轮询间隔，在快速模式下可以设置更小的值
+    #[serde(default = "defaults::order_grab_check_interval_ms")]
+    pub order_grab_check_interval_ms: u64,
+    
+    /// 优先级gas提升
+    ///
+    /// 在抢单时额外增加的gas价格（gwei）
+    #[serde(default = "defaults::priority_gas_boost")]
+    pub priority_gas_boost: u64,
+    
+    /// 跳过价格盈利性检查
+    ///
+    /// 在快速模式下跳过详细的价格盈利性计算
+    #[serde(default)]
+    pub fast_lock_skip_price_check: bool,
+    
+    /// 跳过数据库状态检查
+    ///
+    /// 在快速模式下跳过数据库中的订单状态检查
+    #[serde(default)]
+    pub fast_lock_skip_db_check: bool,
+    
+    /// 跳过余额检查
+    ///
+    /// 在快速模式下跳过prover余额检查
+    #[serde(default)]
+    pub fast_lock_skip_balance_check: bool,
 }
 
 impl Default for MarketConf {
@@ -286,6 +561,20 @@ impl Default for MarketConf {
             max_concurrent_preflights: defaults::max_concurrent_preflights(),
             order_pricing_priority: OrderPricingPriority::default(),
             order_commitment_priority: OrderCommitmentPriority::default(),
+            order_grab_mode: OrderGrabMode::default(),
+            fast_grab_config: FastGrabConfig::default(),
+            extreme_speed_config: ExtremeSpeedConfig::default(),
+            machine_gun_config: MachineGunConfig::default(),
+            aggressive_gas_multiplier: defaults::aggressive_gas_multiplier(),
+            fast_lock_mode: false,
+            fast_lock_skip_preflight: false,
+            fast_lock_timeout_secs: defaults::fast_lock_timeout_secs(),
+            fast_lock_max_concurrent_locks: defaults::fast_lock_max_concurrent_locks(),
+            order_grab_check_interval_ms: defaults::order_grab_check_interval_ms(),
+            priority_gas_boost: defaults::priority_gas_boost(),
+            fast_lock_skip_price_check: false,
+            fast_lock_skip_db_check: false,
+            fast_lock_skip_balance_check: false,
         }
     }
 }
