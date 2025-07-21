@@ -1029,7 +1029,7 @@ where
 
         let now = now_timestamp();
         let lock_expiration = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
-        let order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
+        let _order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
 
         // 基本时间检查
         if lock_expiration <= now {
@@ -1105,7 +1105,7 @@ where
 
         let now = now_timestamp();
         let lock_expiration = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
-        let order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
+        let _order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
 
         // 基本时间检查
         if lock_expiration <= now {
@@ -1135,7 +1135,7 @@ where
 
         // 价格检查（可跳过）
         if !config.skip_price_check {
-            let min_price = self.config.lock_all()?.market.mcycle_price;
+            let min_price = self.config.lock_all()?.market.mcycle_price.clone();
             let min_mcycle_price = parse_ether(&min_price).context("Failed to parse mcycle_price")?;
             let order_max_price = U256::from(order.request.offer.maxPrice);
             
@@ -1165,7 +1165,7 @@ where
 
         // Journal大小检查（可跳过）
         if !config.skip_journal_size_check {
-            let max_journal_bytes = self.config.lock_all()?.market.max_journal_bytes;
+            let _max_journal_bytes = self.config.lock_all()?.market.max_journal_bytes;
             // 在快速模式下，我们假设journal不会超过限制
             if preflight_result > 100_000_000 { // 对于非常大的cycle数，可能产生大journal
                 tracing::debug!("快速模式：订单 {} 可能产生大journal，检查跳过", order_id);
