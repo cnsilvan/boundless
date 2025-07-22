@@ -1022,9 +1022,19 @@ where
         let now = now_timestamp();
         let order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
         
+        // 首先检查订单是否已经过期
+        if order_expiration <= now {
+            tracing::info!("机关枪模式：订单 {} 已过期，跳过", order_id);
+            return Ok(OrderPricingOutcome::Skip);
+        }
+        
         // 检查最小订单截止时间
         if order_expiration.saturating_sub(now) < config.min_order_deadline {
-            tracing::debug!("机关枪模式：订单 {} 时间不足，跳过", order_id);
+            tracing::debug!("机关枪模式：订单 {} 时间不足（剩余{}秒 < 最小{}秒），跳过", 
+                order_id, 
+                order_expiration.saturating_sub(now), 
+                config.min_order_deadline
+            );
             return Ok(OrderPricingOutcome::Skip);
         }
 
@@ -1096,7 +1106,7 @@ where
 
             if config.use_fast_cycle_estimation {
                 // 使用快速cycle估算（基于订单复杂度的简单启发式）
-                let estimated_cycles = self.estimate_cycles_heuristic(&order.request);
+                let estimated_cycles = self.estimate_cycles_heuristic(&order.request)?;
                 
                 if estimated_cycles > max_cycles {
                     tracing::debug!("极速模式：订单 {} cycle估算超限 ({} > {})", order_id, estimated_cycles, max_cycles);
@@ -1314,7 +1324,7 @@ where
     }
 
     /// 使用启发式方法估算cycles（无需实际执行）
-    fn estimate_cycles_heuristic(&self, request: &boundless_market::contracts::ProofRequest) -> u64 {
+    fn estimate_cycles_heuristic(&self, request: &boundless_market::contracts::ProofRequest) -> Result<u64, OrderPickerErr> {
         // 基于请求特征的简单启发式估算
         let base_cycles = 1_000_000; // 1M cycles 基础值
         
@@ -1347,7 +1357,7 @@ where
         // 从配置文件读取heuristic_max_cycles
         let max_cycles = self.config.lock_all().context("Failed to read config")?.market.heuristic_max_cycles;
         
-        estimated.min(max_cycles).max(100_000) // 100K - max_cycles (避免会话限制)
+        Ok(estimated.min(max_cycles).max(100_000)) // 100K - max_cycles (避免会话限制)
     }
 }
 
