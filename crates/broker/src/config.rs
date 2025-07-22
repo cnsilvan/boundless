@@ -141,6 +141,19 @@ mod defaults {
     pub const fn priority_gas_boost() -> u64 {
         200
     }
+    
+    // 新增的cycle限制相关默认值
+    pub const fn fast_preflight_limit() -> u64 {
+        80_000_000 // 80M cycles
+    }
+    
+    pub const fn heuristic_max_cycles() -> u64 {
+        80_000_000 // 80M cycles  
+    }
+    
+    pub const fn accept_all_selectors() -> bool {
+        false // 默认不接受所有selector
+    }
 }
 
 /// Order pricing priority mode for determining which orders to price first
@@ -323,6 +336,7 @@ pub struct MarketConf {
     /// Optional max cycles (in mcycles)
     ///
     /// Orders over this max_cycles will be skipped after preflight
+    /// Can be overridden by MAX_MCYCLE_LIMIT environment variable
     pub max_mcycle_limit: Option<u64>,
     /// Optional priority requestor addresses that can bypass the mcycle limit and max input size limit.
     ///
@@ -526,6 +540,25 @@ pub struct MarketConf {
     /// 在快速模式下跳过prover余额检查
     #[serde(default)]
     pub fast_lock_skip_balance_check: bool,
+    
+    /// 快速预检cycle限制
+    ///
+    /// 用于快速预检的最大cycle限制，避免RISC0会话限制
+    #[serde(default = "defaults::fast_preflight_limit")]
+    pub fast_preflight_limit: u64,
+    
+    /// 启发式估算最大cycles
+    ///
+    /// 启发式cycle估算的上限，避免RISC0会话限制
+    #[serde(default = "defaults::heuristic_max_cycles")]
+    pub heuristic_max_cycles: u64,
+    
+    /// 接受所有selector类型
+    ///
+    /// 如果启用，将接受所有proof selector类型，解决"Unsupported selector"错误
+    /// 注意：这可能带来安全风险，建议仅在必要时启用
+    #[serde(default = "defaults::accept_all_selectors")]
+    pub accept_all_selectors: bool,
 }
 
 impl Default for MarketConf {
@@ -575,6 +608,9 @@ impl Default for MarketConf {
             fast_lock_skip_price_check: false,
             fast_lock_skip_db_check: false,
             fast_lock_skip_balance_check: false,
+            fast_preflight_limit: defaults::fast_preflight_limit(),
+            heuristic_max_cycles: defaults::heuristic_max_cycles(),
+            accept_all_selectors: defaults::accept_all_selectors(),
         }
     }
 }
@@ -727,6 +763,8 @@ impl Config {
             .context(format!("Failed to read config file from {path:?}"))?;
         toml::from_str(&data).context(format!("Failed to parse toml file from {path:?}"))
     }
+    
+
 
     /// Write the config to disk
     #[cfg(feature = "test-utils")]

@@ -184,6 +184,20 @@ where
             provider.default_signer_address(),
         );
 
+        // 创建更宽松的SupportedSelectors，支持更多selector类型
+        let mut supported_selectors = SupportedSelectors::default();
+        
+        // 添加对更多selector的支持（用于抢单模式的兼容性）
+        use risc0_ethereum_contracts::selector::Selector;
+        use alloy::primitives::FixedBytes;
+        use boundless_market::selector::ProofType;
+        
+        // 添加所有常见的Groth16 selector支持
+        supported_selectors.add_selector(FixedBytes::from(Selector::Groth16V1_1 as u32), ProofType::Groth16);
+        supported_selectors.add_selector(FixedBytes::from(Selector::Groth16V2_1 as u32), ProofType::Groth16);
+        
+        // accept_all_selectors 将在运行时从配置文件中读取
+
         Self {
             db,
             config,
@@ -191,7 +205,7 @@ where
             provider,
             chain_monitor,
             market,
-            supported_selectors: SupportedSelectors::default(),
+            supported_selectors,
             new_order_rx: Arc::new(Mutex::new(new_order_rx)),
             priced_orders_tx: order_result_tx,
             stake_token_decimals,
@@ -392,11 +406,18 @@ where
         }
 
         if !self.supported_selectors.is_supported(order.request.requirements.selector) {
-            tracing::info!(
-                "Removing order {order_id} because it has an unsupported selector requirement"
-            );
-
-            return Ok(Skip);
+            let accept_all_selectors = self.config.lock_all().context("Failed to read config")?.market.accept_all_selectors;
+            if accept_all_selectors {
+                tracing::warn!(
+                    "⚠️  订单 {} 使用了不支持的selector，但配置accept_all_selectors=true，继续处理",
+                    order_id
+                );
+            } else {
+                tracing::info!(
+                    "Removing order {order_id} because it has an unsupported selector requirement"
+                );
+                return Ok(Skip);
+            }
         };
 
         // Check if the stake is sane and if we can afford it
@@ -987,6 +1008,17 @@ where
         let order_id = order.id();
         tracing::info!("处理机关枪模式订单: {}", order_id);
 
+        // 检查selector支持（即使在机关枪模式下也必须检查）
+        if !self.supported_selectors.is_supported(order.request.requirements.selector) {
+            let accept_all_selectors = self.config.lock_all().context("Failed to read config")?.market.accept_all_selectors;
+            if accept_all_selectors {
+                tracing::warn!("⚠️  机关枪模式：订单 {} selector不支持，但配置accept_all_selectors=true，继续处理", order_id);
+            } else {
+                tracing::info!("机关枪模式：订单 {} selector不支持，跳过", order_id);
+                return Ok(OrderPricingOutcome::Skip);
+            }
+        }
+
         let now = now_timestamp();
         let order_expiration = order.request.offer.biddingStart + order.request.offer.timeout as u64;
         
@@ -1026,6 +1058,17 @@ where
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         tracing::info!("处理极速抢单模式订单: {}", order_id);
+
+        // 检查selector支持
+        if !self.supported_selectors.is_supported(order.request.requirements.selector) {
+            let accept_all_selectors = self.config.lock_all().context("Failed to read config")?.market.accept_all_selectors;
+            if accept_all_selectors {
+                tracing::warn!("⚠️  极速模式：订单 {} selector不支持，但配置accept_all_selectors=true，继续处理", order_id);
+            } else {
+                tracing::info!("极速模式：订单 {} selector不支持，跳过", order_id);
+                return Ok(OrderPricingOutcome::Skip);
+            }
+        }
 
         let now = now_timestamp();
         let lock_expiration = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
@@ -1102,6 +1145,17 @@ where
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         tracing::info!("处理快速抢单模式订单: {}", order_id);
+
+        // 检查selector支持
+        if !self.supported_selectors.is_supported(order.request.requirements.selector) {
+            let accept_all_selectors = self.config.lock_all().context("Failed to read config")?.market.accept_all_selectors;
+            if accept_all_selectors {
+                tracing::warn!("⚠️  快速模式：订单 {} selector不支持，但配置accept_all_selectors=true，继续处理", order_id);
+            } else {
+                tracing::info!("快速模式：订单 {} selector不支持，跳过", order_id);
+                return Ok(OrderPricingOutcome::Skip);
+            }
+        }
 
         let now = now_timestamp();
         let lock_expiration = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
@@ -1185,9 +1239,13 @@ where
         
         // 快速检查是否支持该selector
         if !self.supported_selectors.is_supported(order.request.requirements.selector) {
-            return Err(OrderPickerErr::UnexpectedErr(Arc::new(anyhow::anyhow!(
-                "Unsupported selector"
-            ))));
+            let accept_all_selectors = self.config.lock_all().context("Failed to read config")?.market.accept_all_selectors;
+            if accept_all_selectors {
+                tracing::debug!("快速预检：不支持的selector，但配置accept_all_selectors=true，继续处理");
+            } else {
+                tracing::debug!("快速预检：不支持的selector，返回最小cycle数");
+                return Ok(100_000); // 返回最小值，会被后续逻辑跳过
+            }
         }
 
         // 尝试使用缓存的结果
@@ -1206,7 +1264,8 @@ where
             .map_err(|e| OrderPickerErr::FetchInputErr(Arc::new(e)))?;
 
         // 使用较小的executor limit来加快预检 (避免RISC0会话限制)
-        let exec_limit = 80_000_000; // 80M cycles limit for fast preflight (~77Mcycles)
+        // 从配置文件读取fast_preflight_limit
+        let exec_limit = self.config.lock_all().context("Failed to read config")?.market.fast_preflight_limit;
         
         match self.prover.preflight(&image_id_str, &input_id, vec![], Some(exec_limit), &order.id()).await {
             Ok(result) => {
@@ -1285,7 +1344,10 @@ where
         let estimated = (base_cycles as f64 * input_size_factor * selector_factor * predicate_factor) as u64;
         
         // 限制在RISC0会话限制内 (~89Mcycles = 93,323,264 cycles)
-        estimated.min(80_000_000).max(100_000) // 100K - 80M cycles (避免会话限制)
+        // 从配置文件读取heuristic_max_cycles
+        let max_cycles = self.config.lock_all().context("Failed to read config")?.market.heuristic_max_cycles;
+        
+        estimated.min(max_cycles).max(100_000) // 100K - max_cycles (避免会话限制)
     }
 }
 
