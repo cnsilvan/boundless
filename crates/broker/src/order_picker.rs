@@ -1219,12 +1219,12 @@ where
                 Err(_) => {
                     tracing::warn!("快速模式：订单 {} 预检超时，使用估算值", order_id);
                     // 使用启发式估算
-                    self.estimate_cycles_heuristic(&order.request)
+                    self.estimate_cycles_heuristic(&order.request)?
                 }
             }
         } else {
             // 跳过预检，使用启发式估算
-            self.estimate_cycles_heuristic(&order.request)
+            self.estimate_cycles_heuristic(&order.request)?
         };
 
         // Journal大小检查（可跳过）
@@ -1291,7 +1291,7 @@ where
             }
             Err(_) => {
                 // 预检失败，使用启发式估算
-                Ok(self.estimate_cycles_heuristic(&order.request))
+                Ok(self.estimate_cycles_heuristic(&order.request)?)
             }
         }
     }
