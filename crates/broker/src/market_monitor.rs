@@ -404,100 +404,102 @@ where
                         match log_res {
                             Some(Ok((event, log))) => {
                                 rpc_manager.report_success();
-                            tracing::debug!(
-                                "Detected request 0x{:x} locked by {:x}",
-                                event.requestId,
-                                event.prover,
-                            );
-                            if let Err(e) = db
-                                .set_request_locked(
-                                    U256::from(event.requestId),
-                                    &event.prover.to_string(),
-                                    log.block_number.unwrap(),
-                                )
-                                .await
-                            {
-                                match e {
-                                    DbError::SqlUniqueViolation(_) => {
-                                        tracing::warn!("Duplicate request locked detected {:x}: {e:?}", event.requestId);
-                                    }
-                                    _ => {
-                                        tracing::error!("Failed to store request locked for request {:x} in db: {e:?}", event.requestId);
+                                tracing::debug!(
+                                    "Detected request 0x{:x} locked by {:x}",
+                                    event.requestId,
+                                    event.prover,
+                                );
+                                if let Err(e) = db
+                                    .set_request_locked(
+                                        U256::from(event.requestId),
+                                        &event.prover.to_string(),
+                                        log.block_number.unwrap(),
+                                    )
+                                    .await
+                                {
+                                    match e {
+                                        DbError::SqlUniqueViolation(_) => {
+                                            tracing::warn!("Duplicate request locked detected {:x}: {e:?}", event.requestId);
+                                        }
+                                        _ => {
+                                            tracing::error!("Failed to store request locked for request {:x} in db: {e:?}", event.requestId);
+                                        }
                                     }
                                 }
-                            }
 
-                            // Send order state change message for any active preflight of this order
-                            let state_change = OrderStateChange::Locked {
-                                request_id: U256::from(event.requestId),
-                                prover: event.prover,
-                            };
-                            if let Err(e) = order_state_tx.send(state_change) {
-                                tracing::warn!("Failed to send order state change message for request {:x}: {e:?}", event.requestId);
-                            }
+                                // Send order state change message for any active preflight of this order
+                                let state_change = OrderStateChange::Locked {
+                                    request_id: U256::from(event.requestId),
+                                    prover: event.prover,
+                                };
+                                if let Err(e) = order_state_tx.send(state_change) {
+                                    tracing::warn!("Failed to send order state change message for request {:x}: {e:?}", event.requestId);
+                                }
 
-                            // If the request was not locked by the prover, we create an order to evaluate the request
-                            // for fulfilling after the lock expires.
-                            if event.prover != prover_addr {
-                                // Try to get from market first. If the request was submitted via the order stream, we will be unable to find it there.
-                                // In that case we check the order stream.
-                                let mut order: Option<OrderRequest> = None;
-                                if let Ok((proof_request, signature)) = market.get_submitted_request(event.requestId, None).await {
-                                    order = Some(OrderRequest::new(
-                                        proof_request,
-                                        signature,
-                                        FulfillmentType::FulfillAfterLockExpire,
-                                        market_addr,
-                                        chain_id,
-                                    ));
-                                } else if let Some(order_stream) = &order_stream {
-                                    if let Ok(order_stream_order) = order_stream.fetch_order(event.requestId, None).await {
-                                        let proof_request = order_stream_order.request;
-                                        let signature = order_stream_order.signature;
+                                // If the request was not locked by the prover, we create an order to evaluate the request
+                                // for fulfilling after the lock expires.
+                                if event.prover != prover_addr {
+                                    // Try to get from market first. If the request was submitted via the order stream, we will be unable to find it there.
+                                    // In that case we check the order stream.
+                                    let mut order: Option<OrderRequest> = None;
+                                    if let Ok((proof_request, signature)) = market.get_submitted_request(event.requestId, None).await {
                                         order = Some(OrderRequest::new(
                                             proof_request,
-                                            signature.as_bytes().into(),
+                                            signature,
                                             FulfillmentType::FulfillAfterLockExpire,
                                             market_addr,
                                             chain_id,
                                         ));
+                                    } else if let Some(order_stream) = &order_stream {
+                                        if let Ok(order_stream_order) = order_stream.fetch_order(event.requestId, None).await {
+                                            let proof_request = order_stream_order.request;
+                                            let signature = order_stream_order.signature;
+                                            order = Some(OrderRequest::new(
+                                                proof_request,
+                                                signature.as_bytes().into(),
+                                                FulfillmentType::FulfillAfterLockExpire,
+                                                market_addr,
+                                                chain_id,
+                                            ));
+                                        }
                                     }
-                                }
 
-                                if let Some(order) = order {
-                                    if let Err(e) = new_order_tx.send(Box::new(order)).await {
-                                        tracing::error!("Failed to send order locked by another prover, {:x}: {e:?}", event.requestId);
+                                    if let Some(order) = order {
+                                        if let Err(e) = new_order_tx.send(Box::new(order)).await {
+                                            tracing::error!("Failed to send order locked by another prover, {:x}: {e:?}", event.requestId);
+                                        }
+                                    } else {
+                                        tracing::warn!("Failed to get order from market or order stream for locked request {:x}. Unable to evaluate for fulfillment after lock expires.", event.requestId);
                                     }
-                                } else {
-                                    tracing::warn!("Failed to get order from market or order stream for locked request {:x}. Unable to evaluate for fulfillment after lock expires.", event.requestId);
                                 }
                             }
                         }
                         Some(Err(err)) => {
-                            // 将错误转换为TransportError以便RPC管理器处理
-                            let transport_err = alloy::transports::TransportError::Transport(
-                                alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
-                            );
-                            
-                            if rpc_manager.report_error(&transport_err).await {
-                                tracing::warn!("🔄 RequestLocked - 连续RPC错误，重建连接并重新订阅事件");
-                                rpc_manager.mark_connection_rebuilt().await;
-                                stream_active = false; // 退出内层循环，重新创建连接
+                                // 将错误转换为TransportError以便RPC管理器处理
+                                let transport_err = alloy::transports::TransportError::Transport(
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
+                                );
+                                
+                                if rpc_manager.report_error(&transport_err).await {
+                                    tracing::warn!("🔄 RequestLocked - 连续RPC错误，重建连接并重新订阅事件");
+                                    rpc_manager.mark_connection_rebuilt().await;
+                                    stream_active = false; // 退出内层循环，重新创建连接
+                                    break;
+                                } else {
+                                    let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                                    tracing::warn!("Failed to fetch RequestLocked event log: {event_err:?}");
+                                }
+                            }
+                            None => {
+                                tracing::warn!("🔄 RequestLocked事件流已关闭，重新创建连接");
+                                stream_active = false;
                                 break;
-                            } else {
-                                let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
-                                tracing::warn!("Failed to fetch RequestLocked event log: {event_err:?}");
                             }
                         }
-                        None => {
-                            tracing::warn!("🔄 RequestLocked事件流已关闭，重新创建连接");
-                            stream_active = false;
-                            break;
-                        }
                     }
-                }
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
+                    _ = cancel_token.cancelled() => {
+                        return Ok(());
+                    }
                 }
             }
             
