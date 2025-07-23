@@ -300,7 +300,7 @@ where
                             Some(Ok((event, _))) => {
                                 rpc_manager.report_success();
                                 
-                                if let Err(err) = Self::process_event(
+                                if let Err(err) = MarketMonitor::<P>::process_event(
                                     event,
                                     provider.clone(),
                                     market_addr,
@@ -316,7 +316,7 @@ where
                             Some(Err(err)) => {
                                 // 将错误转换为TransportError以便RPC管理器处理
                                 let transport_err = alloy::transports::TransportError::Transport(
-                                    alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)) as Box<dyn std::error::Error + Send + Sync>)
                                 );
                                 
                                 if rpc_manager.report_error(&transport_err).await {
@@ -349,7 +349,7 @@ where
 
     /// Monitors the RequestLocked events and updates the database accordingly.
     #[allow(clippy::too_many_arguments)]
-    async fn monitor_order_locks(
+    async fn monitor_order_locks<P>(
         market_addr: Address,
         prover_addr: Address,
         provider: Arc<P>,
@@ -359,7 +359,10 @@ where
         order_state_tx: broadcast::Sender<OrderStateChange>,
         rpc_manager: SmartRpcManager,
         cancel_token: CancellationToken,
-    ) -> Result<(), MarketMonitorErr> {
+    ) -> Result<(), MarketMonitorErr>
+    where
+        P: Provider<Ethereum> + 'static + Clone,
+    {
         let chain_id = provider.get_chain_id().await.context("Failed to get chain id")?;
         
         loop {
@@ -379,7 +382,7 @@ where
                 }
                 Err(err) => {
                     let transport_err = alloy::transports::TransportError::Transport(
-                        alloy::transports::TransportErrorKind::Custom(Box::new(err))
+                        alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
                     );
                     
                     if rpc_manager.report_error(&transport_err).await {
@@ -418,29 +421,32 @@ where
                                     .await
                                 {
                                     match e {
-                                        DbError::SqlUniqueViolation(_) => {
-                                            tracing::warn!("Duplicate request locked detected {:x}: {e:?}", event.requestId);
+                                        SettingRequestLockedError::RequestNotInDb => {
+                                            tracing::info!(
+                                                "Request 0x{:x} not in database, likely from another prover, skipping",
+                                                event.requestId
+                                            );
                                         }
-                                        _ => {
-                                            tracing::error!("Failed to store request locked for request {:x} in db: {e:?}", event.requestId);
+                                        SettingRequestLockedError::InvalidRequestState => {
+                                            tracing::warn!(
+                                                "Request 0x{:x} is not in submitted state, cannot set to locked",
+                                                event.requestId
+                                            );
+                                        }
+                                        SettingRequestLockedError::InternalError(e) => {
+                                            tracing::error!("Failed to set request 0x{:x} locked: {e:?}", event.requestId);
                                         }
                                     }
                                 }
 
-                                // Send order state change message for any active preflight of this order
-                                let state_change = OrderStateChange::Locked {
-                                    request_id: U256::from(event.requestId),
-                                    prover: event.prover,
-                                };
-                                if let Err(e) = order_state_tx.send(state_change) {
-                                    tracing::warn!("Failed to send order state change message for request {:x}: {e:?}", event.requestId);
-                                }
+                                let _ = order_state_tx.send(OrderStateChange::OrderLocked {
+                                    order_id: U256::from(event.requestId),
+                                });
 
-                                // If the request was not locked by the prover, we create an order to evaluate the request
-                                // for fulfilling after the lock expires.
                                 if event.prover != prover_addr {
-                                    // Try to get from market first. If the request was submitted via the order stream, we will be unable to find it there.
-                                    // In that case we check the order stream.
+                                    tracing::info!("Request 0x{:x} locked by other prover {:x}, scheduling for fulfillment evaluation after lock expires.", event.requestId, event.prover);
+                                    
+                                    // Try to get from market first
                                     let mut order: Option<OrderRequest> = None;
                                     if let Ok((proof_request, signature)) = market.get_submitted_request(event.requestId, None).await {
                                         order = Some(OrderRequest::new(
@@ -473,13 +479,12 @@ where
                                     }
                                 }
                             }
-                        }
-                        Some(Err(err)) => {
-                            // 将错误转换为TransportError以便RPC管理器处理
-                            let transport_err = alloy::transports::TransportError::Transport(
-                                alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
-                            );
-                                
+                            Some(Err(err)) => {
+                                // 将错误转换为TransportError以便RPC管理器处理
+                                let transport_err = alloy::transports::TransportError::Transport(
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
+                                );
+                                    
                                 if rpc_manager.report_error(&transport_err).await {
                                     tracing::warn!("🔄 RequestLocked - 连续RPC错误，重建连接并重新订阅事件");
                                     rpc_manager.mark_connection_rebuilt().await;
@@ -719,14 +724,14 @@ where
             })?;
 
             tokio::try_join!(
-                Self::monitor_orders(
+                MarketMonitor::<P>::monitor_orders(
                     market_addr,
                     provider.clone(),
                     new_order_tx.clone(),
                     self.rpc_manager.clone(),
                     cancel_token.clone()
                 ),
-                Self::monitor_order_fulfillments(
+                MarketMonitor::<P>::monitor_order_fulfillments(
                     market_addr,
                     provider.clone(),
                     db.clone(),
@@ -734,7 +739,7 @@ where
                     self.rpc_manager.clone(),
                     cancel_token.clone()
                 ),
-                Self::monitor_order_locks(
+                MarketMonitor::<P>::monitor_order_locks(
                     market_addr,
                     prover_addr,
                     provider.clone(),
