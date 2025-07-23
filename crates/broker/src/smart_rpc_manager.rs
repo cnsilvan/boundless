@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 use crate::rpc_retry_policy::is_filter_error;
 use alloy::transports::TransportError;

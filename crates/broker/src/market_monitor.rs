@@ -316,7 +316,7 @@ where
                             Some(Err(err)) => {
                                 // 将错误转换为TransportError以便RPC管理器处理
                                 let transport_err = alloy::transports::TransportError::Transport(
-                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
                                 );
                                 
                                 if rpc_manager.report_error(&transport_err).await {
@@ -475,10 +475,10 @@ where
                             }
                         }
                         Some(Err(err)) => {
-                                // 将错误转换为TransportError以便RPC管理器处理
-                                let transport_err = alloy::transports::TransportError::Transport(
-                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
-                                );
+                            // 将错误转换为TransportError以便RPC管理器处理
+                            let transport_err = alloy::transports::TransportError::Transport(
+                                alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
+                            );
                                 
                                 if rpc_manager.report_error(&transport_err).await {
                                     tracing::warn!("🔄 RequestLocked - 连续RPC错误，重建连接并重新订阅事件");
@@ -509,14 +509,17 @@ where
     }
 
     /// Monitors the RequestFulfilled events and updates the database accordingly.
-    async fn monitor_order_fulfillments(
+    async fn monitor_order_fulfillments<P>(
         market_addr: Address,
         provider: Arc<P>,
         db: DbObj,
         order_state_tx: broadcast::Sender<OrderStateChange>,
         rpc_manager: SmartRpcManager,
         cancel_token: CancellationToken,
-    ) -> Result<(), MarketMonitorErr> {
+    ) -> Result<(), MarketMonitorErr>
+    where
+        P: Provider<Ethereum> + 'static + Clone,
+    {
         loop {
             let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
             
@@ -591,7 +594,7 @@ where
                             Some(Err(err)) => {
                                 // 将错误转换为TransportError以便RPC管理器处理
                                 let transport_err = alloy::transports::TransportError::Transport(
-                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
                                 );
                                 
                                 if rpc_manager.report_error(&transport_err).await {
@@ -622,13 +625,16 @@ where
         }
     }
 
-    async fn process_event(
+    async fn process_event<P>(
         event: IBoundlessMarket::RequestSubmitted,
         provider: Arc<P>,
         market_addr: Address,
         chain_id: u64,
         new_order_tx: &mpsc::Sender<Box<OrderRequest>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        P: Provider<Ethereum> + 'static + Clone,
+    {
         tracing::info!("Detected new on-chain request 0x{:x}", event.requestId);
         // Check the request id flag to determine if the request is smart contract signed. If so we verify the
         // ERC1271 signature by calling isValidSignature on the smart contract client. Otherwise we verify the
