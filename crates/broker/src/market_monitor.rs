@@ -316,7 +316,7 @@ where
                             Some(Err(err)) => {
                                 // 将错误转换为TransportError以便RPC管理器处理
                                 let transport_err = alloy::transports::TransportError::Transport(
-                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)) as Box<dyn std::error::Error + Send + Sync>)
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
                                 );
                                 
                                 if rpc_manager.report_error(&transport_err).await {
@@ -349,7 +349,7 @@ where
 
     /// Monitors the RequestLocked events and updates the database accordingly.
     #[allow(clippy::too_many_arguments)]
-    async fn monitor_order_locks<P>(
+    async fn monitor_order_locks(
         market_addr: Address,
         prover_addr: Address,
         provider: Arc<P>,
@@ -421,26 +421,21 @@ where
                                     .await
                                 {
                                     match e {
-                                        SettingRequestLockedError::RequestNotInDb => {
+                                        crate::db::DbError::SqlUniqueViolation(_) => {
                                             tracing::info!(
-                                                "Request 0x{:x} not in database, likely from another prover, skipping",
+                                                "Request 0x{:x} already marked as locked in database, skipping",
                                                 event.requestId
                                             );
                                         }
-                                        SettingRequestLockedError::InvalidRequestState => {
-                                            tracing::warn!(
-                                                "Request 0x{:x} is not in submitted state, cannot set to locked",
-                                                event.requestId
-                                            );
-                                        }
-                                        SettingRequestLockedError::InternalError(e) => {
+                                        _ => {
                                             tracing::error!("Failed to set request 0x{:x} locked: {e:?}", event.requestId);
                                         }
                                     }
                                 }
 
-                                let _ = order_state_tx.send(OrderStateChange::OrderLocked {
-                                    order_id: U256::from(event.requestId),
+                                let _ = order_state_tx.send(OrderStateChange::Locked {
+                                    request_id: U256::from(event.requestId),
+                                    prover: event.prover,
                                 });
 
                                 if event.prover != prover_addr {
@@ -496,25 +491,23 @@ where
                                 }
                             }
                             None => {
-                                tracing::warn!("🔄 RequestLocked事件流已关闭，重新创建连接");
+                                tracing::warn!("🔄 RequestLocked 事件流意外结束，重新订阅...");
                                 stream_active = false;
                                 break;
                             }
                         }
                     }
                     _ = cancel_token.cancelled() => {
+                        tracing::info!("Cancelling RequestLocked event monitoring");
                         return Ok(());
                     }
                 }
             }
-            
-            // 在重新连接前稍作延迟
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
     /// Monitors the RequestFulfilled events and updates the database accordingly.
-    async fn monitor_order_fulfillments<P>(
+    async fn monitor_order_fulfillments(
         market_addr: Address,
         provider: Arc<P>,
         db: DbObj,
@@ -542,7 +535,7 @@ where
                 }
                 Err(err) => {
                     let transport_err = alloy::transports::TransportError::Transport(
-                        alloy::transports::TransportErrorKind::Custom(Box::new(err))
+                        alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
                     );
                     
                     if rpc_manager.report_error(&transport_err).await {
@@ -567,7 +560,10 @@ where
                         match log_res {
                             Some(Ok((event, log))) => {
                                 rpc_manager.report_success();
-                                tracing::debug!("Detected request fulfilled 0x{:x}", event.requestId);
+                                tracing::debug!(
+                                    "Detected request 0x{:x} fulfilled",
+                                    event.requestId,
+                                );
                                 if let Err(e) = db
                                     .set_request_fulfilled(
                                         U256::from(event.requestId),
@@ -575,33 +571,19 @@ where
                                     )
                                     .await
                                 {
-                                    match e {
-                                        DbError::SqlUniqueViolation(_) => {
-                                            tracing::warn!("Duplicate fulfillment event detected: {e:?}");
-                                        }
-                                        _ => {
-                                            tracing::error!(
-                                                "Failed to store fulfillment for request id {:x}: {e:?}",
-                                                event.requestId
-                                            );
-                                        }
-                                    }
+                                    tracing::error!("Failed to set request 0x{:x} fulfilled: {e:?}", event.requestId);
                                 }
 
-                                // Send order state change message
-                                let state_change = OrderStateChange::Fulfilled {
+                                let _ = order_state_tx.send(OrderStateChange::Fulfilled {
                                     request_id: U256::from(event.requestId),
-                                };
-                                if let Err(e) = order_state_tx.send(state_change) {
-                                    tracing::warn!("Failed to send order state change message for fulfilled request {:x}: {e:?}", event.requestId);
-                                }
+                                });
                             }
                             Some(Err(err)) => {
                                 // 将错误转换为TransportError以便RPC管理器处理
                                 let transport_err = alloy::transports::TransportError::Transport(
                                     alloy::transports::TransportErrorKind::Custom(Box::new(err.into()))
                                 );
-                                
+                                    
                                 if rpc_manager.report_error(&transport_err).await {
                                     tracing::warn!("🔄 RequestFulfilled - 连续RPC错误，重建连接并重新订阅事件");
                                     rpc_manager.mark_connection_rebuilt().await;
@@ -613,30 +595,28 @@ where
                                 }
                             }
                             None => {
-                                tracing::warn!("🔄 RequestFulfilled事件流已关闭，重新创建连接");
+                                tracing::warn!("🔄 RequestFulfilled 事件流意外结束，重新订阅...");
                                 stream_active = false;
                                 break;
                             }
                         }
                     }
                     _ = cancel_token.cancelled() => {
+                        tracing::info!("Cancelling RequestFulfilled event monitoring");
                         return Ok(());
                     }
                 }
             }
-            
-            // 在重新连接前稍作延迟
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
-    async fn process_event<P>(
+    async fn process_event(
         event: IBoundlessMarket::RequestSubmitted,
         provider: Arc<P>,
         market_addr: Address,
         chain_id: u64,
-        new_order_tx: &mpsc::Sender<Box<OrderRequest>>,
-    ) -> Result<()>
+        new_order_tx: mpsc::Sender<Box<OrderRequest>>,
+    ) -> Result<(), MarketMonitorErr>
     where
         P: Provider<Ethereum> + 'static + Clone,
     {
