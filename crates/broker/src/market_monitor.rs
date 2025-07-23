@@ -679,7 +679,6 @@ where
         }
         Ok(())
     }
-}
 
 impl<P> RetryTask for MarketMonitor<P>
 where
