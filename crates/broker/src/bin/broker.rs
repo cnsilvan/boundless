@@ -72,9 +72,9 @@ async fn main() -> Result<()> {
     });
 
     let dynamic_gas_filler = DynamicGasFiller::new(
-        0.3,  // 30% increase of gas limit (提高以避免out of gas)
-        0.2,  // 20% increase of gas_price per pending transaction (大幅提高)
-        8.0,  // 8x max gas multiplier (大幅提高以确保抢单成功)
+        0.2,  // 30% increase of gas limit (提高以避免out of gas)
+        0.05,  // 20% increase of gas_price per pending transaction (大幅提高)
+        2.0,  // 8x max gas multiplier (大幅提高以确保抢单成功)
         wallet.default_signer().address(),
     );
 

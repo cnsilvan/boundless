@@ -39,6 +39,7 @@ use crate::{
     db::{DbError, DbObj},
     errors::{impl_coded_debug, CodedError},
     task::{RetryRes, RetryTask, SupervisorErr},
+    smart_rpc_manager::{SmartRpcManager, RpcManagerConfig},
     FulfillmentType, OrderRequest, OrderStateChange,
 };
 use thiserror::Error;
@@ -83,6 +84,7 @@ pub struct MarketMonitor<P> {
     order_stream: Option<OrderStreamClient>,
     new_order_tx: mpsc::Sender<Box<OrderRequest>>,
     order_state_tx: broadcast::Sender<OrderStateChange>,
+    rpc_manager: SmartRpcManager,
 }
 
 sol! {
@@ -110,6 +112,12 @@ where
         new_order_tx: mpsc::Sender<Box<OrderRequest>>,
         order_state_tx: broadcast::Sender<OrderStateChange>,
     ) -> Self {
+        let rpc_config = RpcManagerConfig {
+            error_threshold: 5,  // 连续5次filter错误后重建连接
+            min_rebuild_interval: std::time::Duration::from_secs(30),
+            monitoring_window: std::time::Duration::from_secs(60),
+        };
+        
         Self {
             lookback_blocks,
             market_addr,
@@ -120,6 +128,7 @@ where
             order_stream,
             new_order_tx,
             order_state_tx,
+            rpc_manager: SmartRpcManager::new(rpc_config),
         }
     }
 
@@ -243,57 +252,98 @@ where
         market_addr: Address,
         provider: Arc<P>,
         new_order_tx: mpsc::Sender<Box<OrderRequest>>,
+        rpc_manager: SmartRpcManager,
         cancel_token: CancellationToken,
     ) -> Result<(), MarketMonitorErr> {
         let chain_id = provider.get_chain_id().await.context("Failed to get chain id")?;
 
-        let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
-        // TODO: RPC providers can drop filters over time or flush them
-        // we should try and move this to a subscription filter if we have issue with the RPC
-        // dropping filters
-
-        let event = market
-            .instance()
-            .RequestSubmitted_filter()
-            .watch()
-            .await
-            .context("Failed to subscribe to RequestSubmitted event")?;
-        tracing::info!("Subscribed to RequestSubmitted event");
-
-        let mut stream = event.into_stream();
         loop {
-            tokio::select! {
-                log_res = stream.next() => {
-                    match log_res {
-                        Some(Ok((event, _))) => {
-                            if let Err(err) = Self::process_event(
-                                event,
-                                provider.clone(),
-                                market_addr,
-                                chain_id,
-                                &new_order_tx,
-                            )
-                            .await
-                            {
-                                let event_err = MarketMonitorErr::LogProcessingFailed(err);
-                                tracing::error!("Failed to process event log: {event_err:?}");
+            let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
+            
+            let event_result = market
+                .instance()
+                .RequestSubmitted_filter()
+                .watch()
+                .await;
+                
+            let event = match event_result {
+                Ok(event) => {
+                    tracing::info!("✅ 成功订阅 RequestSubmitted 事件");
+                    rpc_manager.report_success();
+                    event
+                }
+                Err(err) => {
+                    let transport_err = alloy::transports::TransportError::Transport(
+                        alloy::transports::TransportErrorKind::Custom(Box::new(err))
+                    );
+                    
+                    if rpc_manager.report_error(&transport_err).await {
+                        tracing::warn!("🔄 RPC管理器建议重建连接，准备重试...");
+                        rpc_manager.mark_connection_rebuilt().await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    
+                    return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
+                        "Failed to subscribe to RequestSubmitted event"
+                    )));
+                }
+            };
+
+            let mut stream = event.into_stream();
+            let mut stream_active = true;
+            
+            while stream_active {
+                tokio::select! {
+                    log_res = stream.next() => {
+                        match log_res {
+                            Some(Ok((event, _))) => {
+                                rpc_manager.report_success();
+                                
+                                if let Err(err) = Self::process_event(
+                                    event,
+                                    provider.clone(),
+                                    market_addr,
+                                    chain_id,
+                                    &new_order_tx,
+                                )
+                                .await
+                                {
+                                    let event_err = MarketMonitorErr::LogProcessingFailed(err);
+                                    tracing::error!("Failed to process event log: {event_err:?}");
+                                }
+                            }
+                            Some(Err(err)) => {
+                                // 将错误转换为TransportError以便RPC管理器处理
+                                let transport_err = alloy::transports::TransportError::Transport(
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
+                                );
+                                
+                                if rpc_manager.report_error(&transport_err).await {
+                                    tracing::warn!("🔄 连续RPC错误，重建连接并重新订阅事件");
+                                    rpc_manager.mark_connection_rebuilt().await;
+                                    stream_active = false; // 退出内层循环，重新创建连接
+                                    break;
+                                } else {
+                                    let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                                    tracing::warn!("Failed to fetch event log: {event_err:?}");
+                                }
+                            }
+                            None => {
+                                tracing::warn!("🔄 事件流已关闭，重新创建连接");
+                                stream_active = false;
+                                break;
                             }
                         }
-                        Some(Err(err)) => {
-                            let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
-                            tracing::warn!("Failed to fetch event log: {event_err:?}");
-                        }
-                        None => {
-                            return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
-                                "Event polling exited, polling failed (possible RPC error)"
-                            )));
-                        }
+                    }
+                    _ = cancel_token.cancelled() => {
+                        return Ok(());
                     }
                 }
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
-                }
             }
+            
+            // 在重新连接前稍作延迟
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
@@ -307,24 +357,53 @@ where
         new_order_tx: mpsc::Sender<Box<OrderRequest>>,
         order_stream: Option<OrderStreamClient>,
         order_state_tx: broadcast::Sender<OrderStateChange>,
+        rpc_manager: SmartRpcManager,
         cancel_token: CancellationToken,
     ) -> Result<(), MarketMonitorErr> {
-        let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
         let chain_id = provider.get_chain_id().await.context("Failed to get chain id")?;
-        let event = market
-            .instance()
-            .RequestLocked_filter()
-            .watch()
-            .await
-            .context("Failed to subscribe to RequestLocked event")?;
-        tracing::info!("Subscribed to RequestLocked event");
-
-        let mut stream = event.into_stream();
+        
         loop {
-            tokio::select! {
-                log_res = stream.next() => {
-                    match log_res {
-                        Some(Ok((event, log))) => {
+            let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
+            
+            let event_result = market
+                .instance()
+                .RequestLocked_filter()
+                .watch()
+                .await;
+                
+            let event = match event_result {
+                Ok(event) => {
+                    tracing::info!("✅ 成功订阅 RequestLocked 事件");
+                    rpc_manager.report_success();
+                    event
+                }
+                Err(err) => {
+                    let transport_err = alloy::transports::TransportError::Transport(
+                        alloy::transports::TransportErrorKind::Custom(Box::new(err))
+                    );
+                    
+                    if rpc_manager.report_error(&transport_err).await {
+                        tracing::warn!("🔄 RequestLocked - RPC管理器建议重建连接，准备重试...");
+                        rpc_manager.mark_connection_rebuilt().await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    
+                    return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
+                        "Failed to subscribe to RequestLocked event"
+                    )));
+                }
+            };
+
+            let mut stream = event.into_stream();
+            let mut stream_active = true;
+            
+            while stream_active {
+                tokio::select! {
+                    log_res = stream.next() => {
+                        match log_res {
+                            Some(Ok((event, log))) => {
+                                rpc_manager.report_success();
                             tracing::debug!(
                                 "Detected request 0x{:x} locked by {:x}",
                                 event.requestId,
@@ -395,13 +474,25 @@ where
                             }
                         }
                         Some(Err(err)) => {
-                            let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
-                            tracing::warn!("Failed to fetch RequestLocked event log: {event_err:?}");
+                            // 将错误转换为TransportError以便RPC管理器处理
+                            let transport_err = alloy::transports::TransportError::Transport(
+                                alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
+                            );
+                            
+                            if rpc_manager.report_error(&transport_err).await {
+                                tracing::warn!("🔄 RequestLocked - 连续RPC错误，重建连接并重新订阅事件");
+                                rpc_manager.mark_connection_rebuilt().await;
+                                stream_active = false; // 退出内层循环，重新创建连接
+                                break;
+                            } else {
+                                let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                                tracing::warn!("Failed to fetch RequestLocked event log: {event_err:?}");
+                            }
                         }
                         None => {
-                            return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
-                                "Event polling exited, polling failed (possible RPC error)",
-                            )));
+                            tracing::warn!("🔄 RequestLocked事件流已关闭，重新创建连接");
+                            stream_active = false;
+                            break;
                         }
                     }
                 }
@@ -409,6 +500,9 @@ where
                     return Ok(());
                 }
             }
+            
+            // 在重新连接前稍作延迟
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
@@ -418,23 +512,51 @@ where
         provider: Arc<P>,
         db: DbObj,
         order_state_tx: broadcast::Sender<OrderStateChange>,
+        rpc_manager: SmartRpcManager,
         cancel_token: CancellationToken,
     ) -> Result<(), MarketMonitorErr> {
-        let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
-        let event = market
-            .instance()
-            .RequestFulfilled_filter()
-            .watch()
-            .await
-            .context("Failed to subscribe to RequestFulfilled event")?;
-        tracing::info!("Subscribed to RequestFulfilled event");
-
-        let mut stream = event.into_stream();
         loop {
+            let market = BoundlessMarketService::new(market_addr, provider.clone(), Address::ZERO);
+            
+            let event_result = market
+                .instance()
+                .RequestFulfilled_filter()
+                .watch()
+                .await;
+                
+            let event = match event_result {
+                Ok(event) => {
+                    tracing::info!("✅ 成功订阅 RequestFulfilled 事件");
+                    rpc_manager.report_success();
+                    event
+                }
+                Err(err) => {
+                    let transport_err = alloy::transports::TransportError::Transport(
+                        alloy::transports::TransportErrorKind::Custom(Box::new(err))
+                    );
+                    
+                    if rpc_manager.report_error(&transport_err).await {
+                        tracing::warn!("🔄 RequestFulfilled - RPC管理器建议重建连接，准备重试...");
+                        rpc_manager.mark_connection_rebuilt().await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    
+                    return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
+                        "Failed to subscribe to RequestFulfilled event"
+                    )));
+                }
+            };
+
+            let mut stream = event.into_stream();
+            let mut stream_active = true;
+            
+            while stream_active {
             tokio::select! {
                 log_res = stream.next() => {
                     match log_res {
                         Some(Ok((event, log))) => {
+                            rpc_manager.report_success();
                             tracing::debug!("Detected request fulfilled 0x{:x}", event.requestId);
                             if let Err(e) = db
                                 .set_request_fulfilled(
@@ -465,13 +587,25 @@ where
                             }
                         }
                         Some(Err(err)) => {
-                            let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
-                            tracing::warn!("Failed to fetch RequestFulfilled event log: {event_err:?}");
+                            // 将错误转换为TransportError以便RPC管理器处理
+                            let transport_err = alloy::transports::TransportError::Transport(
+                                alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
+                            );
+                            
+                            if rpc_manager.report_error(&transport_err).await {
+                                tracing::warn!("🔄 RequestFulfilled - 连续RPC错误，重建连接并重新订阅事件");
+                                rpc_manager.mark_connection_rebuilt().await;
+                                stream_active = false; // 退出内层循环，重新创建连接
+                                break;
+                            } else {
+                                let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                                tracing::warn!("Failed to fetch RequestFulfilled event log: {event_err:?}");
+                            }
                         }
                         None => {
-                            return Err(MarketMonitorErr::EventPollingErr(anyhow::anyhow!(
-                                "Event polling order fulfillments exited, polling failed (possible RPC error)",
-                            )));
+                            tracing::warn!("🔄 RequestFulfilled事件流已关闭，重新创建连接");
+                            stream_active = false;
+                            break;
                         }
                     }
                 }
@@ -479,6 +613,9 @@ where
                     return Ok(());
                 }
             }
+            
+            // 在重新连接前稍作延迟
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
@@ -578,6 +715,7 @@ where
                     market_addr,
                     provider.clone(),
                     new_order_tx.clone(),
+                    self.rpc_manager.clone(),
                     cancel_token.clone()
                 ),
                 Self::monitor_order_fulfillments(
@@ -585,6 +723,7 @@ where
                     provider.clone(),
                     db.clone(),
                     order_state_tx.clone(),
+                    self.rpc_manager.clone(),
                     cancel_token.clone()
                 ),
                 Self::monitor_order_locks(
@@ -595,6 +734,7 @@ where
                     new_order_tx,
                     order_stream,
                     order_state_tx,
+                    self.rpc_manager.clone(),
                     cancel_token
                 )
             )
