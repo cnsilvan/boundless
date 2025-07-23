@@ -552,65 +552,66 @@ where
             let mut stream_active = true;
             
             while stream_active {
-            tokio::select! {
-                log_res = stream.next() => {
-                    match log_res {
-                        Some(Ok((event, log))) => {
-                            rpc_manager.report_success();
-                            tracing::debug!("Detected request fulfilled 0x{:x}", event.requestId);
-                            if let Err(e) = db
-                                .set_request_fulfilled(
-                                    U256::from(event.requestId),
-                                    log.block_number.unwrap(),
-                                )
-                                .await
-                            {
-                                match e {
-                                    DbError::SqlUniqueViolation(_) => {
-                                        tracing::warn!("Duplicate fulfillment event detected: {e:?}");
-                                    }
-                                    _ => {
-                                        tracing::error!(
-                                            "Failed to store fulfillment for request id {:x}: {e:?}",
-                                            event.requestId
-                                        );
+                tokio::select! {
+                    log_res = stream.next() => {
+                        match log_res {
+                            Some(Ok((event, log))) => {
+                                rpc_manager.report_success();
+                                tracing::debug!("Detected request fulfilled 0x{:x}", event.requestId);
+                                if let Err(e) = db
+                                    .set_request_fulfilled(
+                                        U256::from(event.requestId),
+                                        log.block_number.unwrap(),
+                                    )
+                                    .await
+                                {
+                                    match e {
+                                        DbError::SqlUniqueViolation(_) => {
+                                            tracing::warn!("Duplicate fulfillment event detected: {e:?}");
+                                        }
+                                        _ => {
+                                            tracing::error!(
+                                                "Failed to store fulfillment for request id {:x}: {e:?}",
+                                                event.requestId
+                                            );
+                                        }
                                     }
                                 }
-                            }
 
-                            // Send order state change message
-                            let state_change = OrderStateChange::Fulfilled {
-                                request_id: U256::from(event.requestId),
-                            };
-                            if let Err(e) = order_state_tx.send(state_change) {
-                                tracing::warn!("Failed to send order state change message for fulfilled request {:x}: {e:?}", event.requestId);
+                                // Send order state change message
+                                let state_change = OrderStateChange::Fulfilled {
+                                    request_id: U256::from(event.requestId),
+                                };
+                                if let Err(e) = order_state_tx.send(state_change) {
+                                    tracing::warn!("Failed to send order state change message for fulfilled request {:x}: {e:?}", event.requestId);
+                                }
                             }
-                        }
-                        Some(Err(err)) => {
-                            // 将错误转换为TransportError以便RPC管理器处理
-                            let transport_err = alloy::transports::TransportError::Transport(
-                                alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
-                            );
-                            
-                            if rpc_manager.report_error(&transport_err).await {
-                                tracing::warn!("🔄 RequestFulfilled - 连续RPC错误，重建连接并重新订阅事件");
-                                rpc_manager.mark_connection_rebuilt().await;
-                                stream_active = false; // 退出内层循环，重新创建连接
+                            Some(Err(err)) => {
+                                // 将错误转换为TransportError以便RPC管理器处理
+                                let transport_err = alloy::transports::TransportError::Transport(
+                                    alloy::transports::TransportErrorKind::Custom(Box::new(anyhow::anyhow!(err)))
+                                );
+                                
+                                if rpc_manager.report_error(&transport_err).await {
+                                    tracing::warn!("🔄 RequestFulfilled - 连续RPC错误，重建连接并重新订阅事件");
+                                    rpc_manager.mark_connection_rebuilt().await;
+                                    stream_active = false; // 退出内层循环，重新创建连接
+                                    break;
+                                } else {
+                                    let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
+                                    tracing::warn!("Failed to fetch RequestFulfilled event log: {event_err:?}");
+                                }
+                            }
+                            None => {
+                                tracing::warn!("🔄 RequestFulfilled事件流已关闭，重新创建连接");
+                                stream_active = false;
                                 break;
-                            } else {
-                                let event_err = MarketMonitorErr::EventPollingErr(anyhow::anyhow!(err));
-                                tracing::warn!("Failed to fetch RequestFulfilled event log: {event_err:?}");
                             }
-                        }
-                        None => {
-                            tracing::warn!("🔄 RequestFulfilled事件流已关闭，重新创建连接");
-                            stream_active = false;
-                            break;
                         }
                     }
-                }
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
+                    _ = cancel_token.cancelled() => {
+                        return Ok(());
+                    }
                 }
             }
             
